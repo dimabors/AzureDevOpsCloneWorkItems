@@ -76,6 +76,18 @@
         .summary p { margin: 2px 0; }
         .summary a { color: #106ebe; text-decoration: none; }
         .summary a:hover { text-decoration: underline; }
+        .warning {
+            margin-top: 10px;
+            border-left: 4px solid #f0ad4e;
+            background: #fff8e1;
+            color: #5a3a00;
+            padding: 8px 12px;
+            display: none;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .warning.visible { display: block; }
+        .warning strong { color: #5a3a00; }
         .error { color: #a4262c; }
         .spinner {
             display: inline-block;
@@ -119,10 +131,10 @@
         </div>
 
         <div class="btn-row">
-            <button id="cloneBtn" class="btn">Clone</button>
-            <button id="closeBtn" class="btn btn-secondary" style="display:none;">Close</button>
+            <button id="cloneBtn" class="btn" disabled>Clone</button>
         </div>
 
+        <div id="processWarning" class="warning"></div>
         <div id="progress" class="progress"></div>
         <div id="summary" class="summary"></div>
     </div>
@@ -145,6 +157,44 @@
 
             // ── Wired-up by the menu action with the selected ids ────────
             var workItemIds = [];
+
+            // Cache: work-item type name -> initial state name (in "Proposed" category).
+            var initialStateCache = {};
+
+            // Look up the default initial state for a work-item type.
+            // Uses the type's state categories — "Proposed" holds the new/initial state(s).
+            function getInitialState(typeName) {
+                if (initialStateCache[typeName] !== undefined) {
+                    return Promise.resolve(initialStateCache[typeName]);
+                }
+                return witClient.getWorkItemType(projectName, typeName).then(function (wit) {
+                    var pick = null;
+                    if (wit && Array.isArray(wit.states)) {
+                        // Prefer the first state in the "Proposed" category.
+                        for (var i = 0; i < wit.states.length; i++) {
+                            if (wit.states[i].category === "Proposed") {
+                                pick = wit.states[i].name; break;
+                            }
+                        }
+                        // Fallback: first non-Completed/Removed state.
+                        if (!pick) {
+                            for (var j = 0; j < wit.states.length; j++) {
+                                var c = wit.states[j].category;
+                                if (c !== "Completed" && c !== "Removed") {
+                                    pick = wit.states[j].name; break;
+                                }
+                            }
+                        }
+                        // Last resort: whatever the type says is its default new-state.
+                        if (!pick && wit.states.length) pick = wit.states[0].name;
+                    }
+                    initialStateCache[typeName] = pick;
+                    return pick;
+                }, function () {
+                    initialStateCache[typeName] = null;
+                    return null;
+                });
+            }
 
             // Fields we never copy from the source.
             // (They're either system-generated or explicitly overridden.)
@@ -227,35 +277,70 @@
                 return $("optRemote").checked;
             }
 
+            // ── Helpers ─────────────────────────────────────────────────
+            function workItemIdFromUrl(url) {
+                if (!url) return null;
+                var m = /\/workItems\/(\d+)(?:[?#].*)?$/i.exec(url);
+                return m ? parseInt(m[1], 10) : null;
+            }
+
+            // Find the original parent id (Hierarchy-Reverse) of a source work item.
+            function findOriginalParentId(source) {
+                if (!source || !Array.isArray(source.relations)) return null;
+                for (var i = 0; i < source.relations.length; i++) {
+                    var rel = source.relations[i];
+                    if (rel && rel.rel === "System.LinkTypes.Hierarchy-Reverse") {
+                        return workItemIdFromUrl(rel.url);
+                    }
+                }
+                return null;
+            }
+
             // ── Build the JSON Patch document for one clone ─────────────
-            function buildPatchDoc(source, parent, copyTags) {
+            // parentInherit  — the work item we read AreaPath/IterationPath from
+            //                  (always the user-specified new parent)
+            // parentLinkId   — the id we attach as Hierarchy-Reverse for THIS clone
+            //                  (either the new-parent id, or the cloned ancestor's new id)
+            function buildPatchDoc(source, parentInherit, parentLinkId, copyTags) {
                 var patch = [];
 
-                // Copy fields one-to-one, skipping the system / overridden ones.
+                // Copy every field one-to-one (including custom fields), skipping
+                // only the system / overridden ones in SKIP_FIELDS.
+                // getWorkItem(..., expand=All) returns ALL fields the work item has,
+                // so custom-process fields are included automatically.
                 var fields = source.fields || {};
                 Object.keys(fields).forEach(function (name) {
                     if (SKIP_FIELDS[name]) return;
                     if (!copyTags && name === "System.Tags") return;
                     var val = fields[name];
-                    if (val === null || typeof val === "undefined") return;
-                    // Identity fields come back as objects; pass uniqueName when present.
-                    if (typeof val === "object" && val.uniqueName) val = val.uniqueName;
+                    if (typeof val === "undefined" || val === null) return;
+
+                    // Identity fields come back as objects. Prefer uniqueName
+                    // (user@example.com), fall back to descriptor / displayName.
+                    if (typeof val === "object") {
+                        if (val.uniqueName)       val = val.uniqueName;
+                        else if (val.descriptor)  val = val.descriptor;
+                        else if (val.displayName) val = val.displayName;
+                        else return; // unknown object shape — skip rather than corrupt
+                    }
+
+                    // Empty strings are valid (some custom HTML/text fields).
                     patch.push({ op: "add", path: "/fields/" + name, value: val });
                 });
 
-                // Inherited from new parent.
+                // Inherited from the user-specified new parent.
                 patch.push({ op: "add", path: "/fields/System.AreaPath",
-                             value: parent.fields["System.AreaPath"] });
+                             value: parentInherit.fields["System.AreaPath"] });
                 patch.push({ op: "add", path: "/fields/System.IterationPath",
-                             value: parent.fields["System.IterationPath"] });
+                             value: parentInherit.fields["System.IterationPath"] });
 
-                // Parent link.
+                // Parent link (preserving original hierarchy among selected items).
                 patch.push({
                     op: "add",
                     path: "/relations/-",
                     value: {
                         rel: "System.LinkTypes.Hierarchy-Reverse",
-                        url: collectionUri + "_apis/wit/workItems/" + parent.id,
+                        url: collectionUri + "_apis/wit/workItems/" + parentLinkId,
                         attributes: { comment: "Cloned via Clone Work Items extension" }
                     }
                 });
@@ -284,22 +369,84 @@
                        "/_workitems/edit/" + id;
             }
 
-            function cloneOne(sourceId, parent) {
-                return witClient.getWorkItem(
-                    sourceId, null, null, WitContracts.WorkItemExpand.All
-                ).then(function (source) {
-                    var type = source.fields["System.WorkItemType"];
-                    var copyTags = $("optTags").checked;
-                    var patch = buildPatchDoc(source, parent, copyTags);
+            // Fetch all sources up-front (with relations) so we can compute hierarchy.
+            function fetchAllSources(ids) {
+                // getWorkItems supports up to 200 ids; for simplicity fetch one-by-one in parallel.
+                var promises = ids.map(function (id) {
+                    return witClient.getWorkItem(id, null, null, WitContracts.WorkItemExpand.All)
+                        .then(function (wi) { return { id: id, wi: wi }; },
+                              function (err) { return { id: id, error: err }; });
+                });
+                return Promise.all(promises);
+            }
+
+            // Topologically order sources so a parent is always cloned before its children.
+            // Returns an array of source items in clone order.
+            function orderByHierarchy(sources, selectedSet) {
+                // Build map id -> source
+                var byId = {};
+                sources.forEach(function (s) { byId[s.id] = s; });
+
+                var ordered = [];
+                var visited = {};
+                var visiting = {};
+
+                function visit(id) {
+                    if (visited[id]) return;
+                    if (visiting[id]) return; // cycle guard
+                    visiting[id] = true;
+                    var s = byId[id];
+                    if (s && s.wi) {
+                        var origParent = findOriginalParentId(s.wi);
+                        if (origParent && selectedSet[origParent]) {
+                            visit(origParent);
+                        }
+                    }
+                    visiting[id] = false;
+                    visited[id] = true;
+                    ordered.push(s);
+                }
+
+                sources.forEach(function (s) { visit(s.id); });
+                return ordered;
+            }
+
+            function cloneOne(source, parentInherit, parentLinkId) {
+                var type = source.fields["System.WorkItemType"];
+                var copyTags = $("optTags").checked;
+                return getInitialState(type).then(function (initialState) {
+                    var patch = buildPatchDoc(source, parentInherit, parentLinkId, copyTags);
+                    if (initialState) {
+                        patch.push({ op: "add", path: "/fields/System.State", value: initialState });
+                    }
+                    // bypassRules=false → workflow rules apply, so the state machine
+                    // accepts the initial state and any required-field defaults kick in.
                     return witClient.createWorkItem(
-                        patch, projectName, type, false, true
+                        patch, projectName, type, false, false
                     ).then(function (created) {
-                        return { ok: true, sourceId: sourceId, newId: created.id, type: type,
+                        return { ok: true, sourceId: source.id, newId: created.id, type: type,
                                  title: created.fields["System.Title"] };
+                    }, function (err) {
+                        return { ok: false, sourceId: source.id, type: type,
+                                 error: (err && err.message) || String(err) };
                     });
-                }).then(null, function (err) {
-                    return { ok: false, sourceId: sourceId,
-                             error: (err && err.message) || String(err) };
+                });
+            }
+
+            // ── Process compatibility check ─────────────────────────────
+            // For each unique source work-item type, check whether the same type
+            // exists in the parent's project. Returns { ok: [type,...], missing: [type,...] }.
+            function checkTypeCompatibility(parentProject, types) {
+                var checks = types.map(function (t) {
+                    return witClient.getWorkItemType(parentProject, t)
+                        .then(function () { return { type: t, exists: true }; },
+                              function ()  { return { type: t, exists: false }; });
+                });
+                return Promise.all(checks).then(function (rows) {
+                    return {
+                        ok:      rows.filter(function (r) { return  r.exists; }).map(function (r) { return r.type; }),
+                        missing: rows.filter(function (r) { return !r.exists; }).map(function (r) { return r.type; })
+                    };
                 });
             }
 
@@ -308,49 +455,133 @@
                 var parentId = parseInt(parentIdRaw, 10);
                 if (!parentId || parentId <= 0) {
                     alert("Please enter a valid parent work item ID.");
-                    return;
+                    return Promise.resolve();
                 }
                 if (!workItemIds.length) {
                     alert("No source work items provided.");
-                    return;
+                    return Promise.resolve();
                 }
 
+                // Disable the in-page Clone button so it can't be re-clicked while running.
                 $("cloneBtn").disabled = true;
+                $("processWarning").classList.remove("visible");
+                $("processWarning").innerHTML = "";
                 progressEl.innerHTML = "";
                 summaryEl.classList.remove("visible");
                 summaryEl.innerHTML = "";
 
                 logProgress("Loading parent #" + parentId + " ...");
-                witClient.getWorkItem(parentId).then(function (parent) {
+                return witClient.getWorkItem(parentId).then(function (parent) {
+                    var parentProject = parent.fields["System.TeamProject"];
                     logProgress("Parent: " + parent.fields["System.WorkItemType"] +
                                 " — " + parent.fields["System.Title"]);
+                    logProgress("Project: "        + parentProject);
                     logProgress("Area Path: "      + parent.fields["System.AreaPath"]);
                     logProgress("Iteration Path: " + parent.fields["System.IterationPath"]);
-                    logProgress("Cloning " + workItemIds.length + " work item(s)...");
+                    logProgress("Loading " + workItemIds.length + " source work item(s)...");
 
-                    // Sequentially clone to keep progress output readable
-                    // and to avoid hammering the API.
-                    var results = [];
-                    var chain = Promise.resolve();
-                    workItemIds.forEach(function (id) {
-                        chain = chain.then(function () {
-                            logProgress("  → cloning #" + id + " ...");
-                            return cloneOne(id, parent).then(function (r) {
-                                results.push(r);
-                                if (r.ok) {
-                                    logProgress("    ✓ created #" + r.newId + " (" + r.type + ")");
-                                } else {
-                                    logProgress("    ✗ failed: " + r.error, true);
+                    return fetchAllSources(workItemIds).then(function (fetched) {
+                        var sources = [];
+                        var loadErrors = [];
+                        var selectedSet = {};
+                        fetched.forEach(function (f) {
+                            if (f.error) {
+                                loadErrors.push({ ok: false, sourceId: f.id,
+                                    error: "Failed to load source: " + ((f.error && f.error.message) || String(f.error)) });
+                            } else {
+                                sources.push({ id: f.id, wi: f.wi });
+                                selectedSet[f.id] = true;
+                            }
+                        });
+
+                        // Collect unique work-item types and check compatibility with target project.
+                        var typeSet = {};
+                        sources.forEach(function (s) { typeSet[s.wi.fields["System.WorkItemType"]] = true; });
+                        var uniqueTypes = Object.keys(typeSet);
+
+                        return checkTypeCompatibility(parentProject, uniqueTypes).then(function (compat) {
+                            // Report missing types if any.
+                            if (compat.missing.length) {
+                                var msg =
+                                    "<strong>⚠ Process / type mismatch detected.</strong><br/>" +
+                                    "The target project <strong>" + escapeHtml(parentProject) + "</strong> " +
+                                    "does not have these work-item types: <strong>" +
+                                    compat.missing.map(escapeHtml).join(", ") + "</strong>.<br/>" +
+                                    "This usually means the source and target projects use different " +
+                                    "processes (e.g. Scrum vs Agile vs Basic). " +
+                                    "Work items of those types will be <strong>skipped</strong>. " +
+                                    "Compatible types will still be cloned.";
+                                $("processWarning").innerHTML = msg;
+                                $("processWarning").classList.add("visible");
+                                logProgress("WARNING: type(s) not present in target project '" +
+                                            parentProject + "': " + compat.missing.join(", "), true);
+
+                                // Confirm before proceeding so the user is fully aware.
+                                if (!window.confirm(
+                                    "The target project does not have these work-item types:\n  " +
+                                    compat.missing.join(", ") +
+                                    "\n\nThe source and target projects probably use different processes " +
+                                    "(e.g. Scrum vs Agile). Items of those types will be skipped.\n\n" +
+                                    "Continue cloning the compatible items?")) {
+                                    logProgress("Aborted by user.", true);
+                                    $("cloneBtn").disabled = false;
+                                    return { parent: parent, results: loadErrors, aborted: true };
                                 }
+                            }
+
+                            // Skip incompatible items.
+                            var skipResults = [];
+                            var compatibleSources = sources.filter(function (s) {
+                                var t = s.wi.fields["System.WorkItemType"];
+                                if (compat.missing.indexOf(t) >= 0) {
+                                    skipResults.push({ ok: false, sourceId: s.id, type: t,
+                                        error: "Skipped — type '" + t + "' does not exist in target project '" + parentProject + "'." });
+                                    return false;
+                                }
+                                return true;
                             });
+                            // Rebuild selectedSet without the skipped items so hierarchy ordering is correct.
+                            var compatSet = {};
+                            compatibleSources.forEach(function (s) { compatSet[s.id] = true; });
+
+                            var ordered = orderByHierarchy(compatibleSources, compatSet);
+                            logProgress("Cloning " + ordered.length + " work item(s) preserving hierarchy...");
+
+                            var cloneMap = {};
+                            var results = loadErrors.concat(skipResults);
+                            var chain = Promise.resolve();
+
+                            ordered.forEach(function (s) {
+                                chain = chain.then(function () {
+                                    var origParent = findOriginalParentId(s.wi);
+                                    var parentLinkId, parentLabel;
+                                    if (origParent && cloneMap[origParent]) {
+                                        parentLinkId = cloneMap[origParent];
+                                        parentLabel  = "cloned #" + parentLinkId +
+                                                       " (was original parent #" + origParent + ")";
+                                    } else {
+                                        parentLinkId = parent.id;
+                                        parentLabel  = "new parent #" + parent.id;
+                                    }
+                                    logProgress("  → cloning #" + s.id + " under " + parentLabel + " ...");
+                                    return cloneOne(s.wi, parent, parentLinkId).then(function (r) {
+                                        results.push(r);
+                                        if (r.ok) {
+                                            cloneMap[s.id] = r.newId;
+                                            logProgress("    ✓ created #" + r.newId + " (" + r.type + ")");
+                                        } else {
+                                            logProgress("    ✗ failed: " + r.error, true);
+                                        }
+                                    });
+                                });
+                            });
+
+                            return chain.then(function () { return { parent: parent, results: results }; });
                         });
                     });
-
-                    return chain.then(function () { return { parent: parent, results: results }; });
                 }).then(function (out) {
                     showSummary(out.parent, out.results);
-                    $("closeBtn").style.display = "";
-                }).then(null, function (err) {
+                }, function (err) {
                     logProgress("Fatal error: " + ((err && err.message) || String(err)), true);
                     $("cloneBtn").disabled = false;
                 });
@@ -395,33 +626,20 @@
             }
 
             // ── Wire up UI ──────────────────────────────────────────────
+            function refreshCloneBtn() {
+                var pid = parseInt($("parentId").value, 10);
+                $("cloneBtn").disabled = !(pid > 0 && workItemIds.length > 0);
+            }
+            $("parentId").addEventListener("input", refreshCloneBtn);
             $("cloneBtn").addEventListener("click", runClone);
-            $("closeBtn").addEventListener("click", function () {
-                // Close hosted dialog
-                VSS.getService(VSS.ServiceIds.Dialog).then(function () {
-                    // No direct API to close from inside; rely on host close button,
-                    // but we can fire a custom event so the host action could close.
-                    window.parent.postMessage({ type: "clone-work-items:done" }, "*");
-                });
-            });
 
             // ── Contribution instance: receives the selected ids ────────
             VSS.register("clone-work-items-dialog", {
-                onReady: function (ids) { setSelected(ids || []); },
-                getFormState: function () {
-                    return {
-                        parentId: parseInt($("parentId").value, 10) || null,
-                        options: {
-                            related:     $("optRelated").checked,
-                            predSucc:    $("optPredSucc").checked,
-                            affects:     $("optAffects").checked,
-                            tested:      $("optTested").checked,
-                            remote:      $("optRemote").checked,
-                            hyperlinks:  $("optHyperlinks").checked,
-                            attachments: $("optAttachments").checked,
-                            tags:        $("optTags").checked
-                        }
-                    };
+                // setDialog is kept for API compatibility but no longer needed.
+                setDialog: function (_d) { /* no-op */ },
+                onReady: function (ids) {
+                    setSelected(ids || []);
+                    refreshCloneBtn();
                 }
             });
 
@@ -430,6 +648,7 @@
                 var config = VSS.getConfiguration();
                 if (config && Array.isArray(config.workItemIds)) {
                     setSelected(config.workItemIds);
+                    refreshCloneBtn();
                 }
             } catch (e) { /* ignore */ }
 
