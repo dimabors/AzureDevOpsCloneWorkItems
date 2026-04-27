@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Clone Work Items - Action</title>
+</head>
+<body>
+    <script src="../vsts/VSS.SDK.min.js"></script>
+    <script>
+        VSS.init({
+            usePlatformScripts: true,
+            usePlatformStyles: true,
+            explicitNotifyLoaded: true
+        });
+
+        VSS.ready(function () {
+            // Extract work item IDs from any of the action contexts ADO may pass.
+            function extractIds(actionContext) {
+                if (!actionContext) return [];
+                if (Array.isArray(actionContext.workItemIds) && actionContext.workItemIds.length) {
+                    return actionContext.workItemIds.slice();
+                }
+                if (Array.isArray(actionContext.ids) && actionContext.ids.length) {
+                    return actionContext.ids.slice();
+                }
+                if (typeof actionContext.workItemId === "number") {
+                    return [actionContext.workItemId];
+                }
+                if (typeof actionContext.id === "number") {
+                    return [actionContext.id];
+                }
+                if (Array.isArray(actionContext.workItems)) {
+                    return actionContext.workItems
+                        .map(function (w) { return w && (w.id || w.workItemId); })
+                        .filter(function (x) { return typeof x === "number"; });
+                }
+                return [];
+            }
+
+            var menuHandler = {
+                execute: function (actionContext) {
+                    var ids = extractIds(actionContext);
+                    if (!ids.length) {
+                        alert("Clone Work Items: no work items were selected.");
+                        return;
+                    }
+
+                    var extCtx = VSS.getExtensionContext();
+                    var dialogContributionId =
+                        extCtx.publisherId + "." + extCtx.extensionId + ".clone-work-items-dialog";
+
+                    VSS.getService(VSS.ServiceIds.Dialog).then(function (dialogSvc) {
+                        var dialog;
+                        var dialogOptions = {
+                            title: "Clone " + ids.length + " work item" + (ids.length === 1 ? "" : "s"),
+                            width: 560,
+                            height: 560,
+                            resizable: true,
+                            okText: "Clone",
+                            cancelText: "Cancel",
+                            getDialogResult: function () {
+                                // Resolved by the dialog calling notifyDialogResult
+                                return dialogContentRef && dialogContentRef.getFormState
+                                    ? dialogContentRef.getFormState()
+                                    : null;
+                            },
+                            okCallback: function (result) {
+                                // result is what getDialogResult returned (the form state).
+                                // The dialog itself performs the clone before allowing OK,
+                                // so nothing more to do here.
+                            }
+                        };
+
+                        var dialogContentRef = null;
+                        dialogSvc.openDialog(dialogContributionId, dialogOptions, { workItemIds: ids })
+                            .then(function (createdDialog) {
+                                dialog = createdDialog;
+                                // Grab the dialog contribution instance so OK can read form state.
+                                dialog.getContributionInstance("clone-work-items-dialog").then(function (instance) {
+                                    dialogContentRef = instance;
+                                    if (instance && instance.onReady) {
+                                        instance.onReady(ids);
+                                    }
+                                });
+                            });
+                    });
+                }
+            };
+
+            // Register against both the contribution-qualified id and the short id so
+            // the menu host always finds the handler.
+            var ctx = VSS.getExtensionContext();
+            var fullId = ctx.publisherId + "." + ctx.extensionId + ".clone-work-items-action";
+            VSS.register(fullId, menuHandler);
+            VSS.register("clone-work-items-action", menuHandler);
+
+            VSS.notifyLoadSucceeded();
+        });
+    </script>
+</body>
+</html>

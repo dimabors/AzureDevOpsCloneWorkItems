@@ -1,0 +1,17 @@
+{
+  "name": "clone-work-items",
+  "version": "0.1.0",
+  "description": "Azure DevOps extension that clones selected work items under a new parent.",
+  "private": true,
+  "scripts": {
+    "package": "tfx extension create --manifest-globs vss-extension.json --rev-version",
+    "publish": "tfx extension publish --manifest-globs vss-extension.json --rev-version"
+  },
+  "dependencies": {
+    "vss-web-extension-sdk": "^5.141.0"
+  },
+  "devDependencies": {
+    "tfx-cli": "^0.17.0"
+  },
+  "license": "MIT"
+}

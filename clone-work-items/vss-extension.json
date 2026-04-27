@@ -1,0 +1,80 @@
+{
+  "manifestVersion": 1,
+  "id": "clone-work-items",
+  "version": "0.1.0",
+  "name": "Clone Work Items",
+  "description": "Clone one or more work items selected in the Backlog under a new parent. Inherits the parent's Area Path and Iteration; clears Assigned To and resets State.",
+  "publisher": "DimaBors",
+  "public": false,
+  "galleryFlags": [
+    "Public",
+    "Preview"
+  ],
+  "targets": [
+    { "id": "Microsoft.VisualStudio.Services.Cloud" }
+  ],
+  "scopes": [
+    "vso.work_write"
+  ],
+  "icons": {
+    "default": "img/icon.png"
+  },
+  "categories": [
+    "Azure Boards"
+  ],
+  "tags": [
+    "clone",
+    "work item",
+    "backlog",
+    "copy",
+    "duplicate"
+  ],
+  "content": {
+    "details": { "path": "docs/overview.md" }
+  },
+  "links": {
+    "repository": { "uri": "https://github.com/dimabors/AzureDevOpsCloneWorkItems" },
+    "issues":     { "uri": "https://github.com/dimabors/AzureDevOpsCloneWorkItems/issues" }
+  },
+  "repository": {
+    "type": "git",
+    "uri": "https://github.com/dimabors/AzureDevOpsCloneWorkItems"
+  },
+  "contributions": [
+    {
+      "id": "clone-work-items-action",
+      "type": "ms.vss-web.action",
+      "description": "Clone selected work items under a new parent.",
+      "targets": [
+        "ms.vss-work-web.work-item-context-menu",
+        "ms.vss-work-web.backlog-item-menu",
+        "ms.vss-work-web.product-backlog-item-menu",
+        "ms.vss-work-web.backlog-board-pivot-menu",
+        "ms.vss-work-web.work-item-query-menu",
+        "ms.vss-work-web.work-item-query-results-menu"
+      ],
+      "properties": {
+        "text": "Clone Work Items",
+        "title": "Clone the selected work items under a new parent",
+        "icon": "img/icon.png",
+        "groupId": "actions",
+        "uri": "src/menu-action.html",
+        "registeredObjectId": "clone-work-items-action"
+      }
+    },
+    {
+      "id": "clone-work-items-dialog",
+      "type": "ms.vss-web.control",
+      "description": "Dialog used to configure the clone operation.",
+      "targets": [],
+      "properties": {
+        "uri": "src/clone-dialog.html"
+      }
+    }
+  ],
+  "files": [
+    { "path": "src",                              "addressable": true },
+    { "path": "img",                              "addressable": true },
+    { "path": "node_modules/vss-web-extension-sdk/lib", "addressable": true, "packagePath": "vsts" }
+  ]
+}

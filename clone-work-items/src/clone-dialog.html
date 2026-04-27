@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Clone Work Items</title>
+    <style>
+        body {
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 16px 20px;
+            color: #333;
+            font-size: 13px;
+        }
+        h3 { margin: 0 0 8px 0; font-size: 14px; }
+        .row { margin-bottom: 12px; }
+        label { display: block; margin-bottom: 4px; font-weight: 600; }
+        input[type="number"], input[type="text"] {
+            width: 220px;
+            padding: 4px 6px;
+            font-size: 13px;
+            border: 1px solid #c8c8c8;
+            border-radius: 2px;
+        }
+        .hint { color: #666; font-size: 12px; margin-top: 2px; }
+        .checks label {
+            font-weight: normal;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 4px;
+        }
+        .selected-list {
+            max-height: 110px;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            background: #fafafa;
+            padding: 6px 8px;
+            border-radius: 2px;
+            font-family: Consolas, "Courier New", monospace;
+            font-size: 12px;
+        }
+        .btn-row { display: flex; gap: 8px; margin-top: 12px; }
+        .btn {
+            padding: 6px 14px;
+            font-size: 13px;
+            cursor: pointer;
+            border: 1px solid #106ebe;
+            background: #106ebe;
+            color: #fff;
+            border-radius: 2px;
+        }
+        .btn:hover { background: #005a9e; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-secondary { background: #fff; color: #106ebe; }
+        .progress {
+            margin-top: 10px;
+            border-left: 4px solid #106ebe;
+            background: #f4f4f4;
+            padding: 8px 12px;
+            max-height: 180px;
+            overflow-y: auto;
+            font-family: Consolas, "Courier New", monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            display: none;
+        }
+        .progress.visible { display: block; }
+        .summary {
+            margin-top: 10px;
+            border-left: 4px solid #107c10;
+            background: #f4faf4;
+            padding: 10px 14px;
+            display: none;
+        }
+        .summary.visible { display: block; }
+        .summary p { margin: 2px 0; }
+        .summary a { color: #106ebe; text-decoration: none; }
+        .summary a:hover { text-decoration: underline; }
+        .error { color: #a4262c; }
+        .spinner {
+            display: inline-block;
+            width: 14px; height: 14px;
+            border: 2px solid #ccc;
+            border-top-color: #106ebe;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <script src="../vsts/VSS.SDK.min.js"></script>
+
+    <div id="root">
+        <div class="row">
+            <label>Selected work items (<span id="count">0</span>)</label>
+            <div id="selected" class="selected-list"></div>
+        </div>
+
+        <div class="row">
+            <label for="parentId">New parent work item ID</label>
+            <input id="parentId" type="number" min="1" placeholder="e.g. 12345" />
+            <div class="hint">Cloned items will inherit Area Path &amp; Iteration from this parent and be linked to it as children.</div>
+        </div>
+
+        <div class="row checks">
+            <label style="font-weight:600;">Also copy these from the original work items</label>
+            <label><input type="checkbox" id="optRelated"   checked /> Related links</label>
+            <label><input type="checkbox" id="optPredSucc"  checked /> Predecessor / Successor links</label>
+            <label><input type="checkbox" id="optAffects"           /> Affects / Affected By links</label>
+            <label><input type="checkbox" id="optTested"            /> Tested By / Tests links</label>
+            <label><input type="checkbox" id="optRemote"            /> All other work-item links</label>
+            <label><input type="checkbox" id="optHyperlinks" checked /> Hyperlinks</label>
+            <label><input type="checkbox" id="optAttachments"        /> Attachments</label>
+            <label><input type="checkbox" id="optTags"      checked /> Tags</label>
+            <div class="hint">Parent / Child links are never copied — the new parent you specify above is used instead.</div>
+        </div>
+
+        <div class="btn-row">
+            <button id="cloneBtn" class="btn">Clone</button>
+            <button id="closeBtn" class="btn btn-secondary" style="display:none;">Close</button>
+        </div>
+
+        <div id="progress" class="progress"></div>
+        <div id="summary" class="summary"></div>
+    </div>
+
+    <script>
+        VSS.init({
+            usePlatformScripts: true,
+            usePlatformStyles: true,
+            explicitNotifyLoaded: true
+        });
+
+        VSS.require([
+            "TFS/WorkItemTracking/RestClient",
+            "TFS/WorkItemTracking/Contracts"
+        ], function (WitClient, WitContracts) {
+            var witClient = WitClient.getClient();
+            var webContext = VSS.getWebContext();
+            var projectName = webContext.project.name;
+            var collectionUri = webContext.collection.uri;
+
+            // ── Wired-up by the menu action with the selected ids ────────
+            var workItemIds = [];
+
+            // Fields we never copy from the source.
+            // (They're either system-generated or explicitly overridden.)
+            var SKIP_FIELDS = {
+                "System.Id": 1,
+                "System.Rev": 1,
+                "System.AreaId": 1,
+                "System.IterationId": 1,
+                "System.AreaPath": 1,
+                "System.IterationPath": 1,
+                "System.AssignedTo": 1,
+                "System.State": 1,
+                "System.Reason": 1,
+                "System.CreatedBy": 1,
+                "System.CreatedDate": 1,
+                "System.ChangedBy": 1,
+                "System.ChangedDate": 1,
+                "System.AuthorizedAs": 1,
+                "System.AuthorizedDate": 1,
+                "System.RevisedDate": 1,
+                "System.Watermark": 1,
+                "System.NodeName": 1,
+                "System.TeamProject": 1,
+                "System.History": 1,
+                "System.PersonId": 1,
+                "System.BoardColumn": 1,
+                "System.BoardColumnDone": 1,
+                "System.BoardLane": 1,
+                "Microsoft.VSTS.Common.StateChangeDate": 1,
+                "Microsoft.VSTS.Common.ActivatedDate": 1,
+                "Microsoft.VSTS.Common.ActivatedBy": 1,
+                "Microsoft.VSTS.Common.ResolvedDate": 1,
+                "Microsoft.VSTS.Common.ResolvedBy": 1,
+                "Microsoft.VSTS.Common.ClosedDate": 1,
+                "Microsoft.VSTS.Common.ClosedBy": 1
+            };
+
+            // ── DOM helpers ─────────────────────────────────────────────
+            var $ = function (id) { return document.getElementById(id); };
+
+            var progressEl = $("progress");
+            var summaryEl  = $("summary");
+            function logProgress(msg, isError) {
+                progressEl.classList.add("visible");
+                var line = document.createElement("div");
+                if (isError) line.className = "error";
+                line.textContent = msg;
+                progressEl.appendChild(line);
+                progressEl.scrollTop = progressEl.scrollHeight;
+            }
+
+            function setSelected(ids) {
+                workItemIds = ids.slice();
+                $("count").textContent = ids.length;
+                $("selected").textContent = ids.map(function (i) { return "#" + i; }).join(", ");
+            }
+
+            // ── Decide which relations to keep based on checkbox state ──
+            function shouldCopyRelation(rel) {
+                if (!rel || !rel.rel) return false;
+                var t = rel.rel;
+
+                // Never copy parent/child hierarchy — caller picks new parent.
+                if (t === "System.LinkTypes.Hierarchy-Forward") return false;
+                if (t === "System.LinkTypes.Hierarchy-Reverse") return false;
+
+                if (t === "AttachedFile")        return $("optAttachments").checked;
+                if (t === "Hyperlink")           return $("optHyperlinks").checked;
+                if (t === "ArtifactLink")        return $("optHyperlinks").checked;
+
+                if (t === "System.LinkTypes.Related")                       return $("optRelated").checked;
+                if (t === "System.LinkTypes.Dependency-Forward")            return $("optPredSucc").checked;
+                if (t === "System.LinkTypes.Dependency-Reverse")            return $("optPredSucc").checked;
+                if (t === "Microsoft.VSTS.Common.Affects-Forward")          return $("optAffects").checked;
+                if (t === "Microsoft.VSTS.Common.Affects-Reverse")          return $("optAffects").checked;
+                if (t === "Microsoft.VSTS.Common.TestedBy-Forward")         return $("optTested").checked;
+                if (t === "Microsoft.VSTS.Common.TestedBy-Reverse")         return $("optTested").checked;
+
+                // Anything else (Remote links, Shared Steps, etc.)
+                return $("optRemote").checked;
+            }
+
+            // ── Build the JSON Patch document for one clone ─────────────
+            function buildPatchDoc(source, parent, copyTags) {
+                var patch = [];
+
+                // Copy fields one-to-one, skipping the system / overridden ones.
+                var fields = source.fields || {};
+                Object.keys(fields).forEach(function (name) {
+                    if (SKIP_FIELDS[name]) return;
+                    if (!copyTags && name === "System.Tags") return;
+                    var val = fields[name];
+                    if (val === null || typeof val === "undefined") return;
+                    // Identity fields come back as objects; pass uniqueName when present.
+                    if (typeof val === "object" && val.uniqueName) val = val.uniqueName;
+                    patch.push({ op: "add", path: "/fields/" + name, value: val });
+                });
+
+                // Inherited from new parent.
+                patch.push({ op: "add", path: "/fields/System.AreaPath",
+                             value: parent.fields["System.AreaPath"] });
+                patch.push({ op: "add", path: "/fields/System.IterationPath",
+                             value: parent.fields["System.IterationPath"] });
+
+                // Parent link.
+                patch.push({
+                    op: "add",
+                    path: "/relations/-",
+                    value: {
+                        rel: "System.LinkTypes.Hierarchy-Reverse",
+                        url: collectionUri + "_apis/wit/workItems/" + parent.id,
+                        attributes: { comment: "Cloned via Clone Work Items extension" }
+                    }
+                });
+
+                // Other relations the user opted into.
+                if (Array.isArray(source.relations)) {
+                    source.relations.forEach(function (rel) {
+                        if (!shouldCopyRelation(rel)) return;
+                        var copy = { rel: rel.rel, url: rel.url };
+                        if (rel.attributes) {
+                            // Strip read-only attributes; keep comment + name.
+                            copy.attributes = {};
+                            if (rel.attributes.comment) copy.attributes.comment = rel.attributes.comment;
+                            if (rel.attributes.name)    copy.attributes.name    = rel.attributes.name;
+                        }
+                        patch.push({ op: "add", path: "/relations/-", value: copy });
+                    });
+                }
+
+                return patch;
+            }
+
+            // ── The clone pipeline ──────────────────────────────────────
+            function workItemUrl(id) {
+                return webContext.host.uri + webContext.project.name +
+                       "/_workitems/edit/" + id;
+            }
+
+            function cloneOne(sourceId, parent) {
+                return witClient.getWorkItem(
+                    sourceId, null, null, WitContracts.WorkItemExpand.All
+                ).then(function (source) {
+                    var type = source.fields["System.WorkItemType"];
+                    var copyTags = $("optTags").checked;
+                    var patch = buildPatchDoc(source, parent, copyTags);
+                    return witClient.createWorkItem(
+                        patch, projectName, type, false, true
+                    ).then(function (created) {
+                        return { ok: true, sourceId: sourceId, newId: created.id, type: type,
+                                 title: created.fields["System.Title"] };
+                    });
+                }).then(null, function (err) {
+                    return { ok: false, sourceId: sourceId,
+                             error: (err && err.message) || String(err) };
+                });
+            }
+
+            function runClone() {
+                var parentIdRaw = $("parentId").value;
+                var parentId = parseInt(parentIdRaw, 10);
+                if (!parentId || parentId <= 0) {
+                    alert("Please enter a valid parent work item ID.");
+                    return;
+                }
+                if (!workItemIds.length) {
+                    alert("No source work items provided.");
+                    return;
+                }
+
+                $("cloneBtn").disabled = true;
+                progressEl.innerHTML = "";
+                summaryEl.classList.remove("visible");
+                summaryEl.innerHTML = "";
+
+                logProgress("Loading parent #" + parentId + " ...");
+                witClient.getWorkItem(parentId).then(function (parent) {
+                    logProgress("Parent: " + parent.fields["System.WorkItemType"] +
+                                " — " + parent.fields["System.Title"]);
+                    logProgress("Area Path: "      + parent.fields["System.AreaPath"]);
+                    logProgress("Iteration Path: " + parent.fields["System.IterationPath"]);
+                    logProgress("Cloning " + workItemIds.length + " work item(s)...");
+
+                    // Sequentially clone to keep progress output readable
+                    // and to avoid hammering the API.
+                    var results = [];
+                    var chain = Promise.resolve();
+                    workItemIds.forEach(function (id) {
+                        chain = chain.then(function () {
+                            logProgress("  → cloning #" + id + " ...");
+                            return cloneOne(id, parent).then(function (r) {
+                                results.push(r);
+                                if (r.ok) {
+                                    logProgress("    ✓ created #" + r.newId + " (" + r.type + ")");
+                                } else {
+                                    logProgress("    ✗ failed: " + r.error, true);
+                                }
+                            });
+                        });
+                    });
+
+                    return chain.then(function () { return { parent: parent, results: results }; });
+                }).then(function (out) {
+                    showSummary(out.parent, out.results);
+                    $("closeBtn").style.display = "";
+                }).then(null, function (err) {
+                    logProgress("Fatal error: " + ((err && err.message) || String(err)), true);
+                    $("cloneBtn").disabled = false;
+                });
+            }
+
+            function showSummary(parent, results) {
+                var ok = results.filter(function (r) { return r.ok; });
+                var bad = results.filter(function (r) { return !r.ok; });
+
+                var html = "";
+                html += "<p><strong>Clone complete.</strong></p>";
+                html += "<p>Parent: <a target=\"_top\" href=\"" + workItemUrl(parent.id) + "\">#" +
+                        parent.id + " — " + escapeHtml(parent.fields["System.Title"]) + "</a></p>";
+                html += "<p>Cloned " + ok.length + " of " + results.length + " work item(s).</p>";
+                if (ok.length) {
+                    html += "<ul style=\"margin:6px 0 6px 18px;padding:0;\">";
+                    ok.forEach(function (r) {
+                        html += "<li>#" + r.sourceId + " → <a target=\"_top\" href=\"" +
+                                workItemUrl(r.newId) + "\">#" + r.newId + "</a> — " +
+                                escapeHtml(r.title || "") + " <em>(" + escapeHtml(r.type) + ")</em></li>";
+                    });
+                    html += "</ul>";
+                }
+                if (bad.length) {
+                    html += "<p class=\"error\"><strong>" + bad.length + " failed:</strong></p>";
+                    html += "<ul style=\"margin:6px 0 6px 18px;padding:0;\">";
+                    bad.forEach(function (r) {
+                        html += "<li class=\"error\">#" + r.sourceId + ": " +
+                                escapeHtml(r.error) + "</li>";
+                    });
+                    html += "</ul>";
+                }
+
+                summaryEl.innerHTML = html;
+                summaryEl.classList.add("visible");
+            }
+
+            function escapeHtml(s) {
+                return String(s == null ? "" : s)
+                    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;");
+            }
+
+            // ── Wire up UI ──────────────────────────────────────────────
+            $("cloneBtn").addEventListener("click", runClone);
+            $("closeBtn").addEventListener("click", function () {
+                // Close hosted dialog
+                VSS.getService(VSS.ServiceIds.Dialog).then(function () {
+                    // No direct API to close from inside; rely on host close button,
+                    // but we can fire a custom event so the host action could close.
+                    window.parent.postMessage({ type: "clone-work-items:done" }, "*");
+                });
+            });
+
+            // ── Contribution instance: receives the selected ids ────────
+            VSS.register("clone-work-items-dialog", {
+                onReady: function (ids) { setSelected(ids || []); },
+                getFormState: function () {
+                    return {
+                        parentId: parseInt($("parentId").value, 10) || null,
+                        options: {
+                            related:     $("optRelated").checked,
+                            predSucc:    $("optPredSucc").checked,
+                            affects:     $("optAffects").checked,
+                            tested:      $("optTested").checked,
+                            remote:      $("optRemote").checked,
+                            hyperlinks:  $("optHyperlinks").checked,
+                            attachments: $("optAttachments").checked,
+                            tags:        $("optTags").checked
+                        }
+                    };
+                }
+            });
+
+            // Read ids from dialog config (set by openDialog's third arg).
+            try {
+                var config = VSS.getConfiguration();
+                if (config && Array.isArray(config.workItemIds)) {
+                    setSelected(config.workItemIds);
+                }
+            } catch (e) { /* ignore */ }
+
+            VSS.notifyLoadSucceeded();
+        });
+    </script>
+</body>
+</html>
