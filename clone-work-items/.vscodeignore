@@ -1,0 +1,12 @@
+node_modules/
+*.vsix
+*.log
+docs/
+package.json
+package-lock.json
+.gitignore
+.git/
+.vscode/
+.vs/
+README.md
+img/README.txt
