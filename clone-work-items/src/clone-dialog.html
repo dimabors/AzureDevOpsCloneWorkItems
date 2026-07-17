@@ -130,6 +130,16 @@
             <div class="hint">Parent / Child links are never copied — the new parent you specify above is used instead.</div>
         </div>
 
+        <div class="row checks" id="typeFilterRow" style="display:none;">
+            <label style="font-weight:600;">Only copy links pointing to these work item types
+                <span style="font-weight:normal;">
+                    (<a href="#" id="typeFilterAll">all</a> / <a href="#" id="typeFilterNone">none</a>)
+                </span>
+            </label>
+            <div id="typeFilterList"></div>
+            <div class="hint">Links to unchecked types are not copied. Links to work items you cannot read are skipped automatically instead of failing the clone.</div>
+        </div>
+
         <div class="btn-row">
             <button id="cloneBtn" class="btn" disabled>Clone</button>
         </div>
@@ -250,6 +260,7 @@
                 workItemIds = ids.slice();
                 $("count").textContent = ids.length;
                 $("selected").textContent = ids.map(function (i) { return "#" + i; }).join(", ");
+                analyzeLinkTargets();
             }
 
             // ── Decide which relations to keep based on checkbox state ──
@@ -284,6 +295,155 @@
                 return m ? parseInt(m[1], 10) : null;
             }
 
+            // ── Link-target analysis ────────────────────────────────────
+            // linkTargets: target work-item id -> { accessible: bool, type: string }
+            // Populated when the dialog opens by fetching every work item the
+            // selected items link to. Anything we cannot read gets its links
+            // skipped during cloning instead of failing the whole create call.
+            var linkTargets = {};
+            var typeFilterBoxes = {};   // type name -> checkbox element
+            var analyzedIdsKey = null;  // guard against duplicate analysis runs
+
+            // True for relation types whose URL points at another work item.
+            function isWorkItemLink(rel) {
+                if (!rel || !rel.rel) return false;
+                if (rel.rel === "AttachedFile" || rel.rel === "Hyperlink" || rel.rel === "ArtifactLink") return false;
+                return workItemIdFromUrl(rel.url) !== null;
+            }
+
+            function collectLinkTargetIds(wi) {
+                var ids = [];
+                (wi && wi.relations || []).forEach(function (rel) {
+                    if (!isWorkItemLink(rel)) return;
+                    if (rel.rel === "System.LinkTypes.Hierarchy-Forward") return;
+                    if (rel.rel === "System.LinkTypes.Hierarchy-Reverse") return;
+                    ids.push(workItemIdFromUrl(rel.url));
+                });
+                return ids;
+            }
+
+            // Fetch a batch of target ids, tolerating missing/unreadable items.
+            // Tries getWorkItems with errorPolicy=Omit first; if the server or
+            // client version rejects that, falls back to one-by-one fetches.
+            function fetchTargetsTolerant(ids) {
+                var omitPolicy = (WitContracts.WorkItemErrorPolicy &&
+                                  WitContracts.WorkItemErrorPolicy.Omit) || 2;
+                function oneByOne() {
+                    return Promise.all(ids.map(function (id) {
+                        return witClient.getWorkItem(id, ["System.WorkItemType"])
+                            .then(function (wi) { return wi; }, function () { return null; });
+                    })).then(function (list) {
+                        return list.filter(function (wi) { return !!wi; });
+                    });
+                }
+                try {
+                    return witClient.getWorkItems(ids, ["System.WorkItemType"], null, null, omitPolicy)
+                        .then(function (list) { return list || []; }, oneByOne);
+                } catch (e) {
+                    return oneByOne();
+                }
+            }
+
+            function analyzeLinkTargets() {
+                var key = workItemIds.join(",");
+                if (!workItemIds.length || key === analyzedIdsKey) return;
+                analyzedIdsKey = key;
+
+                var row = $("typeFilterRow");
+                var listEl = $("typeFilterList");
+                row.style.display = "";
+                listEl.innerHTML = "<em>Analyzing linked work items…</em>";
+
+                Promise.all(workItemIds.map(function (id) {
+                    return witClient.getWorkItem(id, null, null, WitContracts.WorkItemExpand.Relations)
+                        .then(function (wi) { return wi; }, function () { return null; });
+                })).then(function (sources) {
+                    var idSet = {};
+                    sources.forEach(function (wi) {
+                        collectLinkTargetIds(wi).forEach(function (i) { idSet[i] = 1; });
+                    });
+                    var targetIds = Object.keys(idSet).map(Number);
+                    if (!targetIds.length) {
+                        row.style.display = "none";
+                        return;
+                    }
+                    // getWorkItems accepts max 200 ids per call.
+                    var chunks = [];
+                    for (var i = 0; i < targetIds.length; i += 200) chunks.push(targetIds.slice(i, i + 200));
+                    return Promise.all(chunks.map(fetchTargetsTolerant)).then(function (lists) {
+                        linkTargets = {};
+                        lists.forEach(function (list) {
+                            list.forEach(function (wi) {
+                                linkTargets[wi.id] = {
+                                    accessible: true,
+                                    type: wi.fields["System.WorkItemType"]
+                                };
+                            });
+                        });
+                        var inaccessible = targetIds.filter(function (id) { return !linkTargets[id]; });
+                        inaccessible.forEach(function (id) { linkTargets[id] = { accessible: false }; });
+                        renderTypeFilter(inaccessible);
+                    });
+                }).then(null, function () {
+                    // Analysis is best-effort — cloning still works without it
+                    // thanks to the TF401232 retry fallback.
+                    row.style.display = "none";
+                    analyzedIdsKey = null;
+                });
+            }
+
+            function renderTypeFilter(inaccessibleIds) {
+                var listEl = $("typeFilterList");
+                listEl.innerHTML = "";
+                typeFilterBoxes = {};
+
+                var counts = {};
+                Object.keys(linkTargets).forEach(function (id) {
+                    var t = linkTargets[id];
+                    if (t.accessible && t.type) counts[t.type] = (counts[t.type] || 0) + 1;
+                });
+                var names = Object.keys(counts).sort();
+                if (!names.length && !inaccessibleIds.length) {
+                    $("typeFilterRow").style.display = "none";
+                    return;
+                }
+                names.forEach(function (name) {
+                    var lbl = document.createElement("label");
+                    var cb = document.createElement("input");
+                    cb.type = "checkbox";
+                    cb.checked = true;
+                    typeFilterBoxes[name] = cb;
+                    lbl.appendChild(cb);
+                    lbl.appendChild(document.createTextNode(
+                        " " + name + " (" + counts[name] + " linked item" + (counts[name] > 1 ? "s" : "") + ")"));
+                    listEl.appendChild(lbl);
+                });
+                if (inaccessibleIds.length) {
+                    var note = document.createElement("div");
+                    note.className = "hint";
+                    note.style.color = "#8a6d3b";
+                    note.textContent = "⚠ " + inaccessibleIds.length +
+                        " linked work item(s) cannot be read and their links will be skipped: " +
+                        inaccessibleIds.map(function (i) { return "#" + i; }).join(", ");
+                    listEl.appendChild(note);
+                }
+            }
+
+            function setAllTypeFilters(checked) {
+                Object.keys(typeFilterBoxes).forEach(function (name) {
+                    typeFilterBoxes[name].checked = checked;
+                });
+            }
+            $("typeFilterAll").addEventListener("click", function (e) { e.preventDefault(); setAllTypeFilters(true); });
+            $("typeFilterNone").addEventListener("click", function (e) { e.preventDefault(); setAllTypeFilters(false); });
+
+            // A target type is allowed if no filter is shown for it, or its box is checked.
+            function isTypeAllowed(typeName) {
+                if (!typeName) return true;
+                var cb = typeFilterBoxes[typeName];
+                return cb ? cb.checked : true;
+            }
+
             // Find the original parent id (Hierarchy-Reverse) of a source work item.
             function findOriginalParentId(source) {
                 if (!source || !Array.isArray(source.relations)) return null;
@@ -301,7 +461,10 @@
             //                  (always the user-specified new parent)
             // parentLinkId   — the id we attach as Hierarchy-Reverse for THIS clone
             //                  (either the new-parent id, or the cloned ancestor's new id)
-            function buildPatchDoc(source, parentInherit, parentLinkId, copyTags) {
+            // dropped — collector array; receives a human-readable note for every
+            //           link that was intentionally skipped (inaccessible target
+            //           or filtered-out target type).
+            function buildPatchDoc(source, parentInherit, parentLinkId, copyTags, dropped) {
                 var patch = [];
 
                 // Copy every field one-to-one (including custom fields), skipping
@@ -349,6 +512,25 @@
                 if (Array.isArray(source.relations)) {
                     source.relations.forEach(function (rel) {
                         if (!shouldCopyRelation(rel)) return;
+
+                        // For work-item links, honor the pre-flight analysis:
+                        // skip links whose target we cannot read, and links
+                        // whose target type was unchecked in the type filter.
+                        if (isWorkItemLink(rel)) {
+                            var targetId = workItemIdFromUrl(rel.url);
+                            var info = linkTargets[targetId];
+                            if (info) {
+                                if (!info.accessible) {
+                                    dropped.push("link to #" + targetId + " skipped — target not accessible");
+                                    return;
+                                }
+                                if (!isTypeAllowed(info.type)) {
+                                    dropped.push("link to #" + targetId + " skipped — type '" + info.type + "' not selected");
+                                    return;
+                                }
+                            }
+                        }
+
                         var copy = { rel: rel.rel, url: rel.url };
                         if (rel.attributes) {
                             // Strip read-only attributes; keep comment + name.
@@ -411,23 +593,51 @@
                 return ordered;
             }
 
+            // Create with a safety net: if the server rejects the create because a
+            // linked work item does not exist / is not readable (TF401232), strip
+            // that one relation from the patch and retry — the clone itself must
+            // never fail because of a bad optional link.
+            function createWithLinkRetry(patch, type, dropped, attemptsLeft) {
+                return witClient.createWorkItem(patch, projectName, type, false, false).then(
+                    function (created) { return created; },
+                    function (err) {
+                        var msg = (err && err.message) || String(err);
+                        var m = /TF401232[^0-9]*([0-9]+)/.exec(msg);
+                        if (m && attemptsLeft > 0) {
+                            var badId = parseInt(m[1], 10);
+                            var filtered = patch.filter(function (p) {
+                                return !(p.path === "/relations/-" &&
+                                         p.value &&
+                                         p.value.rel !== "System.LinkTypes.Hierarchy-Reverse" &&
+                                         workItemIdFromUrl(p.value.url) === badId);
+                            });
+                            if (filtered.length < patch.length) {
+                                dropped.push("link to #" + badId + " skipped — target not accessible");
+                                logProgress("    ⚠ link target #" + badId + " not accessible — retrying without that link");
+                                return createWithLinkRetry(filtered, type, dropped, attemptsLeft - 1);
+                            }
+                        }
+                        throw err;
+                    }
+                );
+            }
+
             function cloneOne(source, parentInherit, parentLinkId) {
                 var type = source.fields["System.WorkItemType"];
                 var copyTags = $("optTags").checked;
+                var dropped = [];
                 return getInitialState(type).then(function (initialState) {
-                    var patch = buildPatchDoc(source, parentInherit, parentLinkId, copyTags);
+                    var patch = buildPatchDoc(source, parentInherit, parentLinkId, copyTags, dropped);
                     if (initialState) {
                         patch.push({ op: "add", path: "/fields/System.State", value: initialState });
                     }
                     // bypassRules=false → workflow rules apply, so the state machine
                     // accepts the initial state and any required-field defaults kick in.
-                    return witClient.createWorkItem(
-                        patch, projectName, type, false, false
-                    ).then(function (created) {
+                    return createWithLinkRetry(patch, type, dropped, 25).then(function (created) {
                         return { ok: true, sourceId: source.id, newId: created.id, type: type,
-                                 title: created.fields["System.Title"] };
+                                 title: created.fields["System.Title"], dropped: dropped };
                     }, function (err) {
-                        return { ok: false, sourceId: source.id, type: type,
+                        return { ok: false, sourceId: source.id, type: type, dropped: dropped,
                                  error: (err && err.message) || String(err) };
                     });
                 });
@@ -572,6 +782,11 @@
                                         } else {
                                             logProgress("    ✗ failed: " + r.error, true);
                                         }
+                                        if (r.dropped && r.dropped.length) {
+                                            r.dropped.forEach(function (d) {
+                                                logProgress("      ⚠ " + d);
+                                            });
+                                        }
                                     });
                                 });
                             });
@@ -611,6 +826,18 @@
                     bad.forEach(function (r) {
                         html += "<li class=\"error\">#" + r.sourceId + ": " +
                                 escapeHtml(r.error) + "</li>";
+                    });
+                    html += "</ul>";
+                }
+
+                var withDropped = results.filter(function (r) { return r.dropped && r.dropped.length; });
+                if (withDropped.length) {
+                    html += "<p style=\"color:#8a6d3b;\"><strong>Skipped links:</strong></p>";
+                    html += "<ul style=\"margin:6px 0 6px 18px;padding:0;color:#8a6d3b;\">";
+                    withDropped.forEach(function (r) {
+                        r.dropped.forEach(function (d) {
+                            html += "<li>#" + r.sourceId + ": " + escapeHtml(d) + "</li>";
+                        });
                     });
                     html += "</ul>";
                 }
