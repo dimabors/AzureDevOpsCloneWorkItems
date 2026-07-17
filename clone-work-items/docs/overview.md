@@ -40,11 +40,43 @@ them. For everything else you can opt in via checkboxes:
 - Attachments
 - Tags
 
+### Filter links by target work-item type
+
+When the dialog opens it analyzes everything your selected items link to and
+shows one checkbox per **target type** — for example
+*Test Case (4 linked items)* or *Software Requirement (7 linked items)*.
+Uncheck a type and links pointing at items of that type are not copied.
+This combines with the checkboxes above: a link is copied only if its link
+kind **and** its target's type are both enabled.
+
+### Broken or unreadable links never break the clone
+
+Links pointing at work items that no longer exist — or that you don't have
+permission to read — are detected up front, shown as a warning, and skipped
+automatically. The work items themselves are always cloned; every skipped
+link is listed in the summary so nothing disappears silently.
+
+## Clone linked Test Cases too
+
+If the selected items have **Tested By** links to Test Cases, you can choose
+to clone the test cases as well instead of linking to the originals:
+
+- The cloned work items get *Tested By* links pointing at the **new** test
+  case copies (the reverse *Tests* links are created automatically).
+- Optionally give a **different parent work item ID** for the cloned test
+  cases — otherwise they go under the same new parent.
+- Optionally enter a **Test Plan ID and Test Suite ID** — the cloned test
+  cases are then added to that suite automatically.
+- Test case steps, fields, tags, hyperlinks and attachments are copied;
+  their old work-item links are not (they would point back at the originals).
+
 ## Confirmation
 
 When cloning finishes, a summary lists every source → new work item ID with
-clickable links so you can jump straight into the new items.
+clickable links so you can jump straight into the new items, plus a list of
+any links that were skipped and why.
 
 ## Required permissions
 
 - `vso.work_write` — read and create work items in the project
+- `vso.test_write` — add cloned test cases to a test plan / suite

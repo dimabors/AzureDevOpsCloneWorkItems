@@ -4,12 +4,17 @@
     <meta charset="utf-8" />
     <title>Clone Work Items</title>
     <style>
+        html { height: 100%; }
         body {
             font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
             margin: 0;
             padding: 16px 20px;
             color: #333;
             font-size: 13px;
+            box-sizing: border-box;
+            max-height: 100%;
+            overflow-y: auto !important; /* platform dialog styles may set hidden */
+            -webkit-overflow-scrolling: touch;
         }
         h3 { margin: 0 0 8px 0; font-size: 14px; }
         .row { margin-bottom: 12px; }
@@ -140,6 +145,26 @@
             <div class="hint">Links to unchecked types are not copied. Links to work items you cannot read are skipped automatically instead of failing the clone.</div>
         </div>
 
+        <div class="row checks" id="testCaseRow" style="display:none;">
+            <label style="font-weight:600;">Linked test cases (<span id="tcCount">0</span> found)</label>
+            <label><input type="checkbox" id="optCloneTestCases" /> Clone the linked Test Cases too — new copies are created and the cloned items are linked to the copies instead of the originals</label>
+            <div id="testCaseOptions" style="display:none; margin-left:22px;">
+                <label style="font-weight:normal;">Parent work item ID for the cloned test cases (optional)</label>
+                <input id="testCaseParentId" type="number" min="1" placeholder="defaults to the new parent above" />
+                <div style="display:flex; gap:12px; margin-top:6px;">
+                    <div>
+                        <label style="font-weight:normal;">Test Plan ID</label>
+                        <input id="testPlanId" type="number" min="1" style="width:110px;" placeholder="optional" />
+                    </div>
+                    <div>
+                        <label style="font-weight:normal;">Test Suite ID</label>
+                        <input id="testSuiteId" type="number" min="1" style="width:110px;" placeholder="optional" />
+                    </div>
+                </div>
+                <div class="hint">If both Plan and Suite IDs are set, the cloned test cases are also added to that suite.</div>
+            </div>
+        </div>
+
         <div class="btn-row">
             <button id="cloneBtn" class="btn" disabled>Clone</button>
         </div>
@@ -158,9 +183,11 @@
 
         VSS.require([
             "TFS/WorkItemTracking/RestClient",
-            "TFS/WorkItemTracking/Contracts"
-        ], function (WitClient, WitContracts) {
+            "TFS/WorkItemTracking/Contracts",
+            "TFS/TestManagement/RestClient"
+        ], function (WitClient, WitContracts, TestClient) {
             var witClient = WitClient.getClient();
+            var testClient = TestClient.getClient();
             var webContext = VSS.getWebContext();
             var projectName = webContext.project.name;
             var collectionUri = webContext.collection.uri;
@@ -303,6 +330,7 @@
             var linkTargets = {};
             var typeFilterBoxes = {};   // type name -> checkbox element
             var analyzedIdsKey = null;  // guard against duplicate analysis runs
+            var linkedTestCaseIds = []; // accessible Test Cases on TestedBy-Forward links
 
             // True for relation types whose URL points at another work item.
             function isWorkItemLink(rel) {
@@ -359,12 +387,21 @@
                         .then(function (wi) { return wi; }, function () { return null; });
                 })).then(function (sources) {
                     var idSet = {};
+                    var testedBySet = {};
                     sources.forEach(function (wi) {
                         collectLinkTargetIds(wi).forEach(function (i) { idSet[i] = 1; });
+                        (wi && wi.relations || []).forEach(function (rel) {
+                            if (rel && rel.rel === "Microsoft.VSTS.Common.TestedBy-Forward") {
+                                var tid = workItemIdFromUrl(rel.url);
+                                if (tid) testedBySet[tid] = 1;
+                            }
+                        });
                     });
                     var targetIds = Object.keys(idSet).map(Number);
                     if (!targetIds.length) {
                         row.style.display = "none";
+                        linkedTestCaseIds = [];
+                        updateTestCaseRow();
                         return;
                     }
                     // getWorkItems accepts max 200 ids per call.
@@ -382,6 +419,11 @@
                         });
                         var inaccessible = targetIds.filter(function (id) { return !linkTargets[id]; });
                         inaccessible.forEach(function (id) { linkTargets[id] = { accessible: false }; });
+                        linkedTestCaseIds = Object.keys(testedBySet).map(Number).filter(function (id) {
+                            var t = linkTargets[id];
+                            return t && t.accessible && t.type === "Test Case";
+                        });
+                        updateTestCaseRow();
                         renderTypeFilter(inaccessible);
                     });
                 }).then(null, function () {
@@ -437,6 +479,20 @@
             $("typeFilterAll").addEventListener("click", function (e) { e.preventDefault(); setAllTypeFilters(true); });
             $("typeFilterNone").addEventListener("click", function (e) { e.preventDefault(); setAllTypeFilters(false); });
 
+            function updateTestCaseRow() {
+                var row = $("testCaseRow");
+                if (!linkedTestCaseIds.length) {
+                    row.style.display = "none";
+                    $("optCloneTestCases").checked = false;
+                    return;
+                }
+                row.style.display = "";
+                $("tcCount").textContent = linkedTestCaseIds.length;
+            }
+            $("optCloneTestCases").addEventListener("change", function () {
+                $("testCaseOptions").style.display = this.checked ? "" : "none";
+            });
+
             // A target type is allowed if no filter is shown for it, or its box is checked.
             function isTypeAllowed(typeName) {
                 if (!typeName) return true;
@@ -464,7 +520,10 @@
             // dropped — collector array; receives a human-readable note for every
             //           link that was intentionally skipped (inaccessible target
             //           or filtered-out target type).
-            function buildPatchDoc(source, parentInherit, parentLinkId, copyTags, dropped) {
+            // opts    — { tcCloneMap: {origTestCaseId: newTestCaseId},
+            //             tcMode: true when the item being built IS a test-case clone }
+            function buildPatchDoc(source, parentInherit, parentLinkId, copyTags, dropped, opts) {
+                opts = opts || {};
                 var patch = [];
 
                 // Copy every field one-to-one (including custom fields), skipping
@@ -511,6 +570,28 @@
                 // Other relations the user opted into.
                 if (Array.isArray(source.relations)) {
                     source.relations.forEach(function (rel) {
+                        // Tested By links whose test case is being cloned too:
+                        // point the link at the NEW copy instead of the original.
+                        if (opts.tcCloneMap && rel && rel.rel === "Microsoft.VSTS.Common.TestedBy-Forward") {
+                            var newTcId = opts.tcCloneMap[workItemIdFromUrl(rel.url)];
+                            if (newTcId) {
+                                patch.push({
+                                    op: "add",
+                                    path: "/relations/-",
+                                    value: {
+                                        rel: rel.rel,
+                                        url: collectionUri + "_apis/wit/workItems/" + newTcId,
+                                        attributes: { comment: "Cloned via Clone Work Items extension" }
+                                    }
+                                });
+                                return;
+                            }
+                        }
+
+                        // A test-case clone keeps only hyperlinks/attachments —
+                        // its work-item links would point back at the ORIGINAL items.
+                        if (opts.tcMode && isWorkItemLink(rel)) return;
+
                         if (!shouldCopyRelation(rel)) return;
 
                         // For work-item links, honor the pre-flight analysis:
@@ -622,12 +703,12 @@
                 );
             }
 
-            function cloneOne(source, parentInherit, parentLinkId) {
+            function cloneOne(source, parentInherit, parentLinkId, opts) {
                 var type = source.fields["System.WorkItemType"];
                 var copyTags = $("optTags").checked;
                 var dropped = [];
                 return getInitialState(type).then(function (initialState) {
-                    var patch = buildPatchDoc(source, parentInherit, parentLinkId, copyTags, dropped);
+                    var patch = buildPatchDoc(source, parentInherit, parentLinkId, copyTags, dropped, opts);
                     if (initialState) {
                         patch.push({ op: "add", path: "/fields/System.State", value: initialState });
                     }
@@ -640,6 +721,90 @@
                         return { ok: false, sourceId: source.id, type: type, dropped: dropped,
                                  error: (err && err.message) || String(err) };
                     });
+                });
+            }
+
+            // ── Test-case cloning ───────────────────────────────────────
+            // Clones every accessible Test Case linked (Tested By) from the
+            // selected items. Returns { map: {origId: newId}, results: [...] }.
+            function cloneTestCases(sources, mainParent) {
+                if (!$("optCloneTestCases").checked || !linkedTestCaseIds.length) {
+                    return Promise.resolve({ map: {}, results: [] });
+                }
+
+                // Only test cases actually linked from the items being cloned.
+                var wanted = {};
+                sources.forEach(function (s) {
+                    (s.wi.relations || []).forEach(function (rel) {
+                        if (rel && rel.rel === "Microsoft.VSTS.Common.TestedBy-Forward") {
+                            var tid = workItemIdFromUrl(rel.url);
+                            if (tid && linkedTestCaseIds.indexOf(tid) >= 0) wanted[tid] = 1;
+                        }
+                    });
+                });
+                var tcIds = Object.keys(wanted).map(Number);
+                if (!tcIds.length) return Promise.resolve({ map: {}, results: [] });
+
+                var tcParentId = parseInt($("testCaseParentId").value, 10);
+                var parentPromise = (tcParentId > 0 && tcParentId !== mainParent.id)
+                    ? witClient.getWorkItem(tcParentId)
+                    : Promise.resolve(mainParent);
+
+                return parentPromise.then(function (tcParent) {
+                    logProgress("Cloning " + tcIds.length + " linked test case(s) under parent #" + tcParent.id + " ...");
+                    var map = {};
+                    var results = [];
+                    var chain = Promise.resolve();
+                    tcIds.forEach(function (id) {
+                        chain = chain.then(function () {
+                            return witClient.getWorkItem(id, null, null, WitContracts.WorkItemExpand.All).then(function (tc) {
+                                logProgress("  → cloning test case #" + id + " ...");
+                                return cloneOne(tc, tcParent, tcParent.id, { tcMode: true }).then(function (r) {
+                                    results.push(r);
+                                    if (r.ok) {
+                                        map[id] = r.newId;
+                                        logProgress("    ✓ created test case #" + r.newId);
+                                    } else {
+                                        logProgress("    ✗ failed: " + r.error, true);
+                                    }
+                                });
+                            }, function (err) {
+                                results.push({ ok: false, sourceId: id,
+                                    error: "Failed to load test case: " + ((err && err.message) || String(err)) });
+                                logProgress("  ✗ cannot load test case #" + id, true);
+                            });
+                        });
+                    });
+                    return chain.then(function () {
+                        return addClonesToSuite(map).then(function () {
+                            return { map: map, results: results };
+                        });
+                    });
+                }, function (err) {
+                    logProgress("Cannot load test-case parent #" + tcParentId +
+                        " — test cases will NOT be cloned (links fall back to the originals): " +
+                        ((err && err.message) || String(err)), true);
+                    return { map: {}, results: [] };
+                });
+            }
+
+            // Add the cloned test cases to a test suite, if the user gave plan + suite ids.
+            function addClonesToSuite(map) {
+                var planId = parseInt($("testPlanId").value, 10);
+                var suiteId = parseInt($("testSuiteId").value, 10);
+                var newIds = Object.keys(map).map(function (k) { return map[k]; });
+
+                if (!(planId > 0 && suiteId > 0) || !newIds.length) {
+                    if ((planId > 0) !== (suiteId > 0)) {
+                        logProgress("⚠ Both Test Plan ID and Test Suite ID are required to add test cases to a suite — step skipped.", true);
+                    }
+                    return Promise.resolve();
+                }
+                logProgress("Adding " + newIds.length + " cloned test case(s) to plan #" + planId + ", suite #" + suiteId + " ...");
+                return testClient.addTestCasesToSuite(projectName, planId, suiteId, newIds.join(",")).then(function () {
+                    logProgress("  ✓ added to suite #" + suiteId);
+                }, function (err) {
+                    logProgress("  ✗ could not add to suite: " + ((err && err.message) || String(err)), true);
                 });
             }
 
@@ -755,43 +920,48 @@
                             compatibleSources.forEach(function (s) { compatSet[s.id] = true; });
 
                             var ordered = orderByHierarchy(compatibleSources, compatSet);
-                            logProgress("Cloning " + ordered.length + " work item(s) preserving hierarchy...");
 
-                            var cloneMap = {};
-                            var results = loadErrors.concat(skipResults);
-                            var chain = Promise.resolve();
+                            // Clone linked test cases FIRST so the main clones can
+                            // link to the new copies instead of the originals.
+                            return cloneTestCases(compatibleSources, parent).then(function (tc) {
+                                logProgress("Cloning " + ordered.length + " work item(s) preserving hierarchy...");
 
-                            ordered.forEach(function (s) {
-                                chain = chain.then(function () {
-                                    var origParent = findOriginalParentId(s.wi);
-                                    var parentLinkId, parentLabel;
-                                    if (origParent && cloneMap[origParent]) {
-                                        parentLinkId = cloneMap[origParent];
-                                        parentLabel  = "cloned #" + parentLinkId +
-                                                       " (was original parent #" + origParent + ")";
-                                    } else {
-                                        parentLinkId = parent.id;
-                                        parentLabel  = "new parent #" + parent.id;
-                                    }
-                                    logProgress("  → cloning #" + s.id + " under " + parentLabel + " ...");
-                                    return cloneOne(s.wi, parent, parentLinkId).then(function (r) {
-                                        results.push(r);
-                                        if (r.ok) {
-                                            cloneMap[s.id] = r.newId;
-                                            logProgress("    ✓ created #" + r.newId + " (" + r.type + ")");
+                                var cloneMap = {};
+                                var results = loadErrors.concat(skipResults).concat(tc.results);
+                                var chain = Promise.resolve();
+
+                                ordered.forEach(function (s) {
+                                    chain = chain.then(function () {
+                                        var origParent = findOriginalParentId(s.wi);
+                                        var parentLinkId, parentLabel;
+                                        if (origParent && cloneMap[origParent]) {
+                                            parentLinkId = cloneMap[origParent];
+                                            parentLabel  = "cloned #" + parentLinkId +
+                                                           " (was original parent #" + origParent + ")";
                                         } else {
-                                            logProgress("    ✗ failed: " + r.error, true);
+                                            parentLinkId = parent.id;
+                                            parentLabel  = "new parent #" + parent.id;
                                         }
-                                        if (r.dropped && r.dropped.length) {
-                                            r.dropped.forEach(function (d) {
-                                                logProgress("      ⚠ " + d);
-                                            });
-                                        }
+                                        logProgress("  → cloning #" + s.id + " under " + parentLabel + " ...");
+                                        return cloneOne(s.wi, parent, parentLinkId, { tcCloneMap: tc.map }).then(function (r) {
+                                            results.push(r);
+                                            if (r.ok) {
+                                                cloneMap[s.id] = r.newId;
+                                                logProgress("    ✓ created #" + r.newId + " (" + r.type + ")");
+                                            } else {
+                                                logProgress("    ✗ failed: " + r.error, true);
+                                            }
+                                            if (r.dropped && r.dropped.length) {
+                                                r.dropped.forEach(function (d) {
+                                                    logProgress("      ⚠ " + d);
+                                                });
+                                            }
+                                        });
                                     });
                                 });
-                            });
 
-                            return chain.then(function () { return { parent: parent, results: results }; });
+                                return chain.then(function () { return { parent: parent, results: results }; });
+                            });
                         });
                     });
                 }).then(function (out) {

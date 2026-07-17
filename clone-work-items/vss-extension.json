@@ -1,7 +1,7 @@
 {
   "manifestVersion": 1.0,
   "id": "clone-work-items",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "name": "Clone Work Items",
   "description": "Clone one or more work items selected in the Backlog under a new parent. Inherits the parent's Area Path and Iteration; clears Assigned To and resets State.",
   "publisher": "DimaBors",
@@ -13,7 +13,8 @@
     { "id": "Microsoft.VisualStudio.Services.Cloud" }
   ],
   "scopes": [
-    "vso.work_write"
+    "vso.work_write",
+    "vso.test_write"
   ],
   "icons": {
     "default": "img/icon.png"
