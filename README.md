@@ -4,6 +4,14 @@ An Azure DevOps extension that adds a **Clone Work Items** action to the Backlog
 (and to query results / context menus). Select one or more work items, pick a
 new parent, and the extension creates one-to-one clones underneath it.
 
+## Demo
+
+[![Cloning a work item hierarchy from the Azure DevOps backlog](media/clone-work-items-demo.gif)](media/clone-work-items-demo.mp4)
+
+Selecting a hierarchy on the Backlog, choosing a new parent and link options in
+the dialog, and reviewing the summary of cloned items.
+Click the animation for the [full-resolution MP4](media/clone-work-items-demo.mp4).
+
 ## Features
 
 - Multi-select on the Backlog → right-click → **Clone Work Items**
@@ -62,6 +70,9 @@ clone-work-items/
   docs/
     overview.md         # Marketplace overview page
     contribution.md     # Contributor guide
+media/
+  clone-work-items-demo.gif  # Animation embedded in this README
+  clone-work-items-demo.mp4  # Full-resolution recording (H.264, faststart)
 ```
 
 ## Getting Started
