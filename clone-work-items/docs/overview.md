@@ -3,6 +3,15 @@
 Quickly clone one or many work items under a new parent, directly from the
 Backlog.
 
+## Demo
+
+[![Cloning a work item hierarchy from the Azure DevOps backlog](https://raw.githubusercontent.com/dimabors/AzureDevOpsCloneWorkItems/main/media/clone-work-items-demo.gif)](https://github.com/dimabors/AzureDevOpsCloneWorkItems/blob/main/media/clone-work-items-demo.mp4)
+
+Selecting a hierarchy on the Backlog, choosing a new parent and link options in
+the dialog, and reviewing the summary of cloned items.
+Click the animation for the
+[full-resolution recording](https://github.com/dimabors/AzureDevOpsCloneWorkItems/blob/main/media/clone-work-items-demo.mp4).
+
 ## What it does
 
 Select one or more work items in the Backlog (or in a query result), right-click,
